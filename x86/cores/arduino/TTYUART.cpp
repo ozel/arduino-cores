@@ -34,6 +34,11 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 #include <termios.h>
 #include <unistd.h>
 
+#include <termio.h>
+#include <fcntl.h>
+#include <err.h>
+#include <linux/serial.h>
+
 #define __TTYUART_IDX_TX 1
 #define __TTYUART_IDX_RX 0
 
@@ -256,6 +261,12 @@ void TTYUARTClass::begin( const uint32_t dwBaudRate )
 {
 	struct termios newtios, oldtermios;
 	int ret;
+    
+    struct serial_struct serinfo;
+    static bool custom_baudrate;
+    static char reserved_char;
+    uint8_t additional_flags = 0;
+    static uint8_t old_flags;
 
 	if (_tty_name == NULL) {
 		fprintf(stderr, "tty_name not initialised\n");
@@ -291,6 +302,21 @@ void TTYUARTClass::begin( const uint32_t dwBaudRate )
 	}
 
 	(void)muxSelectUart(_dwId);	// Mux pins as appropriate for this tty
+    
+    if(custom_baudrate) {
+        //clear previously set custom baudrate flags
+        serinfo.reserved_char[0] = reserved_char;
+        if (ioctl(_tty_fd, TIOCGSERIAL, &serinfo) < 0)
+            warnx("couldn't open  TIOCSSERIAL");
+        serinfo.flags &= ~ASYNC_SPD_CUST;
+        serinfo.flags |= ASYNC_SPD_MASK;
+        serinfo.custom_divisor =  0;
+        if (ioctl(_tty_fd, TIOCSSERIAL, &serinfo) < 0)
+            warnx("couldn't open  TIOCSSERIAL");
+        if (ioctl(_tty_fd, TIOCGSERIAL, &serinfo) < 0)
+            warnx("couldn't open TIOCGSERIAL");
+        custom_baudrate = false;
+    }
 
 	switch(dwBaudRate){
 		case 50:
@@ -383,6 +409,38 @@ void TTYUARTClass::begin( const uint32_t dwBaudRate )
 		case B4000000:
 			_dwBaudRate = B4000000;
 			break;
+            
+        /* custom baudrates
+         * based on http://jim.sh/ftx/files/linux-custom-baudrate.c
+         * defines 250.000 kb/s for DMX with 2 stop bits   */
+        
+        case 250000:
+            custom_baudrate = true;
+            /* Custom divisor */
+            reserved_char = serinfo.reserved_char[0];
+            serinfo.reserved_char[0] = 0;
+            if (ioctl(_tty_fd, TIOCGSERIAL, &serinfo) < 0)
+                fprintf(stderr,"couldn't open  TIOCSSERIAL");
+            serinfo.flags &= ~ASYNC_SPD_MASK;
+            serinfo.flags |= ASYNC_SPD_CUST;
+            //serinfo.custom_divisor = (serinfo.baud_base + (dwBaudRate / 2)) / dwBaudRate;
+            serinfo.custom_divisor = 11;
+            if (serinfo.custom_divisor < 1)
+                serinfo.custom_divisor = 1;
+            if (ioctl(_tty_fd, TIOCSSERIAL, &serinfo) < 0)
+                fprintf(stderr,"couldn't open  TIOCSSERIAL");
+            if (ioctl(_tty_fd, TIOCGSERIAL, &serinfo) < 0)
+                fprintf(stderr,"couldn't open TIOCGSERIAL");
+            if (serinfo.custom_divisor * dwBaudRate != serinfo.baud_base) {
+                fprintf(stderr,"actual baudrate is %d / %d = %f",
+                        serinfo.baud_base, serinfo.custom_divisor,
+                        (float)serinfo.baud_base / serinfo.custom_divisor);
+            }
+            additional_flags = CSTOPB; //second stop bit
+            old_flags = additional_flags;
+            _dwBaudRate = B38400; //fake baudrate
+            break;
+            
 		default:
 			_dwBaudRate = B115200;
 			break;
@@ -398,7 +456,12 @@ void TTYUARTClass::begin( const uint32_t dwBaudRate )
 	//newtios.c_cflag |= _dwBaudRate | CRTSCTS | CS8 | CLOCAL | CREAD;
 	newtios.c_cflag = oldtermios.c_cflag;
 	newtios.c_cflag &= ~CBAUD;
-	newtios.c_cflag |= _dwBaudRate;
+    if(old_flags){
+        //clear previous additional flags
+        newtios.c_cflag &= ~old_flags;
+        old_flags = 0;
+    }
+	newtios.c_cflag |= _dwBaudRate | additional_flags;
 	newtios.c_iflag = IGNPAR;
 	newtios.c_oflag = 0;
 
